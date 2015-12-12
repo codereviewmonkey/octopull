@@ -1,6 +1,7 @@
 package nl.tudelft.ewi.sorcerers;
 
 import java.io.BufferedReader;
+import java.io.File;
 import java.io.IOException;
 import java.io.Reader;
 import java.util.ArrayList;
@@ -22,33 +23,36 @@ import com.fasterxml.jackson.dataformat.xml.annotation.JacksonXmlProperty;
 import com.fasterxml.jackson.dataformat.xml.annotation.JacksonXmlRootElement;
 
 @Service
-public class CheckstyleLogParser implements LogParser {
-	private static class CheckStyleError {
-		@JacksonXmlProperty(isAttribute = true)
-		public int line;
-		@JacksonXmlProperty(isAttribute = true)
-		public String severity;
-		@JacksonXmlProperty(localName = "message", isAttribute = true)
-		public String message;
-		@JacksonXmlProperty(isAttribute = true)
-		public String source;
+public class FindBugsLogParser implements LogParser {
+	private static class SourceLine {
+		@JacksonXmlProperty(localName = "primary", isAttribute = true)
+		boolean primary;
+		@JacksonXmlProperty(localName = "start", isAttribute = true)
+		int start;
+		@JacksonXmlProperty(localName = "sourcepath", isAttribute = true)
+		String sourcePath;
 	}
 	
-	private static class CheckStyleFile {
-		@JacksonXmlProperty(localName = "name", isAttribute = true)
-		public String name;
-		@JacksonXmlProperty(localName = "error")
+	private static class BugInstance {
+		@JacksonXmlProperty(localName = "LongMessage")
+		String message;
+		@JacksonXmlProperty(localName = "SourceLine")
 		@JacksonXmlElementWrapper(useWrapping = false)
-		public List<CheckStyleError> errors;
+		public List<SourceLine> lines;
 	}
 
-	@JacksonXmlRootElement(localName="checkstyle")
-	private static class CheckStyleReport {
-		@JacksonXmlProperty(localName = "version", isAttribute = true)
-		public String version;
-		@JacksonXmlProperty(localName = "file")
+	private static class Project {
+		@JacksonXmlProperty(localName = "SrcDir")
+		String sourceDir;
+	}
+	
+	@JacksonXmlRootElement(localName="BugCollection")
+	private static class BugCollection {
+		@JacksonXmlProperty(localName = "Project")
+		public Project project;
+		@JacksonXmlProperty(localName = "BugInstance")
 		@JacksonXmlElementWrapper(useWrapping = false)
-		public List<CheckStyleFile> files;
+		public List<BugInstance> bugs;
 	}
 
 	@Override
@@ -65,12 +69,25 @@ public class CheckstyleLogParser implements LogParser {
 		BufferedReader bufferedReader = null;
 		try {
 			bufferedReader = new BufferedReader(reader);
-			CheckStyleReport report = mapper.readValue(bufferedReader, CheckStyleReport.class);
-			for (CheckStyleFile file : report.files) {
-				String path = file.name;
-				if (file.errors != null) {
-					for (CheckStyleError error : file.errors) {
-						warnings.add(new Warning(null, null, path, error.line, "checkstyle", error.message));
+			BugCollection report = mapper.readValue(bufferedReader, BugCollection.class);
+			if (report.bugs != null) {
+				String srcDir = "";
+				if (report.project != null && report.project.sourceDir != null) {
+					srcDir = report.project.sourceDir;
+				}
+				for (BugInstance bug : report.bugs) {
+					if (bug.lines != null && bug.lines.size() > 0) {					
+						SourceLine line = null;
+						for (SourceLine l : bug.lines) {
+							if (l.primary) {
+								line = l;
+							}
+						}
+						if (line == null) {
+							bug.lines.get(0);
+						}
+						
+						warnings.add(new Warning(null, null, srcDir + "/" + line.sourcePath, line.start, "findbugs", bug.message));
 					}
 				}
 			}

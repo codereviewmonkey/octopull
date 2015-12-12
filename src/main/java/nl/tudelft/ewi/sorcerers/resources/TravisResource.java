@@ -29,6 +29,8 @@ import nl.tudelft.ewi.sorcerers.model.WarningService;
 import nl.tudelft.ewi.sorcerers.util.ReadUntilReader;
 
 import org.glassfish.hk2.api.IterableProvider;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.core.JsonParseException;
@@ -39,6 +41,10 @@ import com.fasterxml.jackson.databind.introspect.JacksonAnnotationIntrospector;
 
 @Path("/travis")
 public class TravisResource {
+	private static final Logger LOGGER = LoggerFactory.getLogger(TravisResource.class);
+	
+	private static final Pattern RESULT_PATTERN = Pattern.compile("^== ([_A-Z]+)_RESULT ==$");
+	private static final Pattern COMMIT_PATTERN = Pattern.compile("^OCTOPULL_SHA=([0-9a-z]+)$");
 	private TravisService travisService;
 	private WarningService warningService;
 	private IterableProvider<LogParser> logParsers;
@@ -81,10 +87,7 @@ public class TravisResource {
 				}
 			}
 			
-			System.out.println(travisPayload.commit);
-			System.out.println("Looping the matrix");
 			for (TravisJobPayload job : travisPayload.matrix) {
-				System.out.println(job.id);
 				InputStream log = null;
 				try {
 					log = this.travisService.getLogFromJobId(host, job.id);
@@ -92,8 +95,8 @@ public class TravisResource {
 						parseLog(travisPayload, log);
 					}
 				} catch (Exception e) {
-					System.out.println("failed to get log");
-					e.printStackTrace();
+					LOGGER.error(String.format("Unable to retrieve log from Travis for job %s of repo %s/%s",
+							job.id, travisPayload.repository.owner_name, travisPayload.repository.name), e);
 				} finally {
 					if (log != null) {
 						log.close();
@@ -113,31 +116,37 @@ public class TravisResource {
 		return Response.ok().build();
 	}
 
-	private void parseLog(TravisPayload travisPayload, InputStream log) {
+	public void parseLog(TravisPayload travisPayload, InputStream log) {
 		String repo = String.format("%s/%s", travisPayload.repository.owner_name, travisPayload.repository.name);
 		String commit = travisPayload.commit;
-		
+
 		BufferedInputStream logStream = new BufferedInputStream(log);
 		BufferedReader reader = null;
 		try {
 			reader = new BufferedReader(new InputStreamReader(logStream, StandardCharsets.UTF_8));
 
-			Pattern resultPattern = Pattern.compile("^== ([_A-Z]+)_RESULT ==$");
+			Pattern commitPattern = COMMIT_PATTERN;
+			Pattern resultPattern = RESULT_PATTERN;
 			String line;
 			while ((line = reader.readLine()) != null){
-				Matcher matcher = resultPattern.matcher(line);
-				if (matcher.matches()) {
-					String tool = matcher.group(1);
-					Reader r = new ReadUntilReader(reader, ("== END_" + tool + "_RESULT ==").toCharArray());
-					LogParser parser = logParsers.named(tool.toLowerCase()).get();
-					if (parser != null) {
-						System.out.println("parser: " + tool);
-						for (Warning warning : parser.parse(r)) {
-							String path = warning.getPath().replaceAll("^/home/travis/build/" + repo + "/", "");
-							this.warningService.addWarningIfNew(repo, commit, path, warning.getLine(), warning.getMessage());
+				Matcher commitMatcher = commitPattern.matcher(line);
+				if (commitMatcher.matches()) {
+					commit = commitMatcher.group(1);
+				} else {
+					Matcher resultMatcher = resultPattern.matcher(line);
+					if (resultMatcher.matches()) {
+						String tool = resultMatcher.group(1);
+						LOGGER.debug("Found section for tool '"+ tool + "'");
+						Reader r = new ReadUntilReader(reader, ("== END_" + tool + "_RESULT ==").toCharArray());
+						LogParser parser = logParsers.named(tool.toLowerCase()).get();
+						if (parser != null) {
+							for (Warning warning : parser.parse(r)) {
+								String path = warning.getPath().replaceAll("^/home/travis/build/" + repo + "/", "");
+								this.warningService.addWarningIfNew(repo, commit, path, warning.getLine(), warning.getTool(), warning.getMessage());
+							}
 						}
+						r.close();
 					}
-					r.close();
 				}
 			}
 		} catch (IOException e) {
@@ -156,18 +165,18 @@ public class TravisResource {
 	}
 	
 	@JsonIgnoreProperties(ignoreUnknown = true)
-	private static class TravisRepository {
+	static class TravisRepository {
 		public String name;
 		public String owner_name;
 	}
 	
 	@JsonIgnoreProperties(ignoreUnknown = true)
-	private static class TravisJobPayload {
+	static class TravisJobPayload {
 		public String id;
 	}
 	
 	@JsonIgnoreProperties(ignoreUnknown = true)
-	private static class TravisPayload {
+	static class TravisPayload {
 		public String commit;
 		public String build_url;
 		public TravisRepository repository;

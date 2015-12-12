@@ -1,5 +1,6 @@
 package nl.tudelft.ewi.sorcerers.servlet;
 
+import static com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES;
 import static javax.ws.rs.client.Entity.form;
 import static javax.ws.rs.core.Response.Status.OK;
 
@@ -7,6 +8,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.UnsupportedEncodingException;
 import java.net.URI;
+import java.net.URLDecoder;
 import java.security.InvalidKeyException;
 import java.security.KeyManagementException;
 import java.security.NoSuchAlgorithmException;
@@ -38,6 +40,7 @@ import javax.ws.rs.container.PreMatching;
 import javax.ws.rs.core.Cookie;
 import javax.ws.rs.core.Form;
 import javax.ws.rs.core.GenericType;
+import javax.ws.rs.core.MediaType;
 import javax.ws.rs.core.MultivaluedMap;
 import javax.ws.rs.core.NewCookie;
 import javax.ws.rs.core.Response;
@@ -47,9 +50,10 @@ import javax.ws.rs.core.UriBuilder;
 import javax.ws.rs.core.UriInfo;
 import javax.ws.rs.ext.Provider;
 
-import org.glassfish.jersey.client.authentication.HttpAuthenticationFeature;
+import org.eclipse.egit.github.core.User;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.databind.AnnotationIntrospector;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.introspect.JacksonAnnotationIntrospector;
@@ -58,6 +62,8 @@ import com.fasterxml.jackson.databind.introspect.JacksonAnnotationIntrospector;
 @PreMatching
 @Provider
 public class GitHubOAuthFilter implements ContainerRequestFilter {
+	@Inject private Logger logger;
+	
 	private String clientId;
 	private String clientSecret;
 
@@ -73,7 +79,12 @@ public class GitHubOAuthFilter implements ContainerRequestFilter {
 		if (githubTokenCookie == null) {
 			return null;
 		} else {
-			return githubTokenCookie.getValue();
+			try {
+				return URLDecoder.decode(githubTokenCookie.getValue(), "UTF-8");
+			} catch (UnsupportedEncodingException e) {
+				e.printStackTrace();
+				return null;
+			}
 		}
 	}
 	
@@ -113,6 +124,7 @@ public class GitHubOAuthFilter implements ContainerRequestFilter {
 				.getBaseUriBuilder().path("oauth/authorize/");
 		uri.queryParam("client_id", this.clientId);
 		uri.queryParam("redirect_uri", redirectUri);
+		uri.queryParam("scope", "repo");
 		uri.queryParam("state", signReturnAddress(returnAddress));
 		
 		requestContext.abortWith(Response.temporaryRedirect(uri.build())
@@ -123,8 +135,7 @@ public class GitHubOAuthFilter implements ContainerRequestFilter {
 			String returnAddress, String token) {
 		String baseUri = requestContext.getUriInfo().getBaseUriBuilder()
 				.scheme(null).host(null).port(-1).toString();
-		
-		System.out.println(baseUri);
+
 		NewCookie tokenCookie = new NewCookie("github_token",
 				token, baseUri, null, Cookie.DEFAULT_VERSION, null,
 				NewCookie.DEFAULT_MAX_AGE, null, false, true);
@@ -178,16 +189,24 @@ public class GitHubOAuthFilter implements ContainerRequestFilter {
 			AuthorizationPayload verifyToken = verifyToken(token);
 
 			if (verifyToken != null) {
+				String ghtoken = null;
+				if (verifyToken.token != null) {
+					ghtoken = verifyToken.token;
+				}
 				String username = null;
-				if (verifyToken.user != null) {
-					username = verifyToken.user.login;
+				if (verifyToken.username != null) {
+					username = verifyToken.username;
 				}
 				List<String> scopes = Arrays.asList(new String[0]);
 				if (verifyToken.scopes != null) {
 					scopes = new ArrayList<String>(verifyToken.scopes);
 				}
+				String tag = null;
+				if (verifyToken.tag != null) {
+					tag = verifyToken.tag;
+				}
 				boolean isSecure = requestContext.getSecurityContext().isSecure();
-				requestContext.setSecurityContext(new GitHubSecurityContext(username, token, scopes, isSecure));
+				requestContext.setSecurityContext(new GitHubSecurityContext(username, ghtoken, tag, scopes, isSecure));
 			}
 		} else {
 //			Response forbiddenResponse = Response.status(Status.FORBIDDEN)
@@ -199,20 +218,38 @@ public class GitHubOAuthFilter implements ContainerRequestFilter {
 	private AuthorizationPayload verifyToken(String token) {
 		Client client = createClient();
 		
-		HttpAuthenticationFeature feature = HttpAuthenticationFeature.basic(this.clientId, this.clientSecret);
+		String[] tokenParts = token.split(";");
+		
+		String ghtoken = tokenParts[0];
+		String etag = null;
+		String username = null;
+		List<String> scopes = null;
+		if (tokenParts.length >= 4) {
+			etag = tokenParts[1];
+			username = tokenParts[2];
+			scopes = Arrays.asList(tokenParts[3].split(","));
+		}
 		
 		Invocation verifyToken = client
-			.target("https://api.github.com/applications/{client_id}/tokens/{access_token}")
-			.resolveTemplate("client_id", this.clientId)
-			.resolveTemplate("access_token", token)
-			.register(feature)
+			.target("https://api.github.com/user")
+			.queryParam("access_token", ghtoken)
 			.request()
+			.accept(MediaType.APPLICATION_JSON)
+			.header("If-None-Match", etag)
 			.buildGet();
 		
 		Response verifyResponse = verifyToken.invoke();
-		if (verifyResponse.getStatus() == 200) {
+		if (verifyResponse.getStatus() == 304) {
+			AuthorizationPayload authPayload = new AuthorizationPayload();
+			authPayload.token = ghtoken;
+			authPayload.username = username;
+			authPayload.tag = etag;
+			authPayload.scopes = scopes;
+			return authPayload;
+		} else if (verifyResponse.getStatus() == 200) {
 			// TODO temporary
 			ObjectMapper mapper = new ObjectMapper();
+			mapper.configure(FAIL_ON_UNKNOWN_PROPERTIES, false);
 			AnnotationIntrospector introspector = new JacksonAnnotationIntrospector();
 			// make deserializer use JAXB annotations (only)
 			mapper.getDeserializationConfig().withAppendedAnnotationIntrospector(
@@ -221,17 +258,30 @@ public class GitHubOAuthFilter implements ContainerRequestFilter {
 			mapper.getSerializationConfig().withAppendedAnnotationIntrospector(
 					introspector);
 
-			AuthorizationPayload authPayload = null;
+			AuthorizationPayload authPayload = new AuthorizationPayload();
+			authPayload.token = ghtoken;
+			String scopesHeader = verifyResponse.getHeaderString("X-OAuth-Scopes");
+			if (scopesHeader != null) {
+				authPayload.scopes = Arrays.asList(scopesHeader.split(", "));
+			}
+			String etagHeader = verifyResponse.getHeaderString("ETag");
+			if (etagHeader != null) {
+				authPayload.tag = etagHeader;
+			}
+			
 			try {
-				authPayload = mapper.readValue(
+				User user = mapper.readValue(
 						(InputStream) verifyResponse.readEntity(InputStream.class),
-						AuthorizationPayload.class);
+						User.class);
+				
+				authPayload.username = user.getLogin();
 			} catch (IOException e) {
 				// TODO fix this
 				throw new RuntimeException("Could not get or parse GitHub Auth response.", e);
 			}
 			return authPayload;
 		} else {
+			logger.error("Received error in verify response %d: %s\n", verifyResponse.getStatus(), verifyResponse.readEntity(String.class));
 			return null;
 		}
 	}
@@ -249,12 +299,12 @@ public class GitHubOAuthFilter implements ContainerRequestFilter {
 		Response exchangeResponse = exchange.invoke();
 		if (exchangeResponse.getStatus() == OK.getStatusCode()) {
 			MultivaluedMap<String, String> exchangeBody = exchangeResponse
-					.readEntity(new GenericType<MultivaluedMap<String, String>>() {
-					});
+					.readEntity(new GenericType<MultivaluedMap<String, String>>() {});
 			// TODO handle errors
 			return exchangeBody.getFirst("access_token");
 		} else {
 			// TODO handle errors
+			System.out.format("Error, token exchange returned status %d", exchangeResponse.getStatus());
 			return null;
 		}
 	}
@@ -295,27 +345,57 @@ public class GitHubOAuthFilter implements ContainerRequestFilter {
 				.hostnameVerifier(hostnameVerifier).build();
 	}
 	
-	@JsonIgnoreProperties(ignoreUnknown = true)
-	private static class UserPayload {
-		public String login;
-	}
-	
-	@JsonIgnoreProperties(ignoreUnknown = true)
 	private static class AuthorizationPayload {
 		public List<String> scopes;
-		public UserPayload user;
+		public String tag;
+		public String username;
+		public String token;
+	}
+	
+	public static class GitHubPrincipal implements Principal {
+		private String username;
+		private String token;
+		private String tag;
+		private ArrayList<String> scopes;
+
+		public GitHubPrincipal(String username, String token, String tag,
+				ArrayList<String> scopes) {
+			this.username = username;
+			this.token = token;
+			this.tag = tag;
+			this.scopes = new ArrayList<String>(scopes);
+		}
+
+		@Override
+		public String getName() {
+			return this.username;
+		}
+		
+		public String getToken() {
+			return this.token;
+		}
+		
+		public String getTag() {
+			return this.tag;
+		}
+		
+		public List<String> getScopes() {
+			return this.scopes;
+		}
 	}
 
 	public static class GitHubSecurityContext implements SecurityContext {
 		private String username;
 		private String token;
+		private String tag;
 		private ArrayList<String> scopes;
 		private boolean secure;
 
-		public GitHubSecurityContext(String username, String token, List<String> scopes,
+		public GitHubSecurityContext(String username, String token, String tag, List<String> scopes,
 				boolean isSecure) {
 			this.username = username;
 			this.token = token;
+			this.tag = tag;
 			this.scopes = new ArrayList<String>(scopes);
 			this.secure = isSecure;
 		}
@@ -329,13 +409,7 @@ public class GitHubOAuthFilter implements ContainerRequestFilter {
 			if (this.username == null) {
 				return null;
 			} else {
-				final String username = this.username;
-				return new Principal() {
-					@Override
-					public String getName() {
-						return username;
-					}
-				};
+				return new GitHubPrincipal(username, token, tag, scopes);
 			}
 		}
 

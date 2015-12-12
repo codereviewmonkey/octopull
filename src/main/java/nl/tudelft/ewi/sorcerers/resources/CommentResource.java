@@ -1,6 +1,7 @@
 package nl.tudelft.ewi.sorcerers.resources;
 
 import java.io.IOException;
+import java.net.URI;
 
 import javax.annotation.security.RolesAllowed;
 import javax.inject.Inject;
@@ -34,7 +35,8 @@ public class CommentResource {
 			@FormParam("pullRequest") Integer pullRequest,
 			@FormParam("warningId") Integer warningId,
 			@FormParam("position") Integer position) throws IOException {
-		this.ccfw.execute(repo, commit, pullRequest, warningId, position);
-		return Response.ok().build();
+		URI commentUri = this.ccfw.execute(this, repo, commit, pullRequest, warningId,
+				position);
+		return Response.created(commentUri).build();
 	}
 }
